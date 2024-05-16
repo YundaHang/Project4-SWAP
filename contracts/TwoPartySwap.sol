@@ -1,64 +1,37 @@
 // SPDX-License-Identifier: UNLICENSED
 
-pragma solidity ^0.8.0;
-
-import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "hardhat/console.sol";
 
 contract TwoPartySwap {
 
-    /**
-    The Swap struct keeps track of participants and swap details
-     */
+    using SafeERC20 for IERC20;
+
     struct Swap {
-        // assetEscrower: who escrows the asset (Alice in diagram)
         address payable assetEscrower;
-        // premiumEscrower: who escrows the premium (Bob in diagram)
         address payable premiumEscrower;
-        // hashLock: the hash of a secret, which only the assetEscrower knows
         bytes32 hashLock;
-        // assetAddress: the ERC20 Token's address, which will be used to access accounts
         address assetAddress;
     }
 
-    /**
-    The Asset struct keeps track of the escrowed Asset
-     */
     struct Asset {
-        // expected: the agreed-upon amount to be escrowed
         uint expected;
-        // current: the current amount of the asset that is escrowed in the swap.
         uint current;
-        // deadline: the time before which the person escrowing their asset must do so
         uint deadline;
-        // timeout: the maximum time the protocol can take, which assumes everything
-        // goes to plan.
         uint timeout;
     }
 
-    /**
-    The Premium struct keeps track of the escrowed premium.
-     */
     struct Premium {
-        // expected: the agreed-upon amount to be escrowed as a premium
         uint expected;
-        // current: the current amount of the premium that is escrowed in the swap
         uint current;
-        // deadline: the time before which the person escrowing their premium must do so
         uint deadline;
     }
 
-    /**
-    Mappings that store our swap details. This contract stores multiple swaps; you can access
-    information about a specific swap by using its hashLock as the key to the appropriate mapping.
-     */
     mapping(bytes32 => Swap) public swaps;
     mapping(bytes32 => Asset) public assets;
     mapping(bytes32 => Premium) public premiums;
 
-    /**
-    SetUp: this event should emit when a swap is successfully setup.
-     */
     event SetUp(
         address payable assetEscrower,
         address payable premiumEscrower,
@@ -67,12 +40,10 @@ contract TwoPartySwap {
         uint startTime,
         uint premiumDeadline,
         uint assetDeadline,
-        uint assetTimeout
+        uint assetTimeout,
+        bool firstAssetEscrow
     );
 
-    /**
-    PremiumEscrowed: this event should emit when the premiumEscrower successfully escrows the premium
-     */
     event PremiumEscrowed (
         address messageSender,
         uint amount,
@@ -82,9 +53,6 @@ contract TwoPartySwap {
         uint currentAsset
     );
 
-    /**
-    AssetEscrowed: this event should emit  when the assetEscrower successfully escrows the asset
-     */
     event AssetEscrowed (
         address messageSender,
         uint amount,
@@ -94,9 +62,6 @@ contract TwoPartySwap {
         uint currentAsset
     );
 
-    /**
-    AssetRedeemed: this event should emit when the assetEscrower successfully escrows the asset
-     */
     event AssetRedeemed(
         address messageSender,
         uint amount,
@@ -106,9 +71,6 @@ contract TwoPartySwap {
         uint currentAsset
     );
 
-    /**
-    PremiumRefunded: this event should emit when the premiumEscrower successfully gets their premium refunded
-     */
     event PremiumRefunded(
         address messageSender,
         uint amount,
@@ -118,10 +80,6 @@ contract TwoPartySwap {
         uint currentAsset
     );
 
-    /**
-    PremiumRedeemed: this event should emit when the counterparty breaks the protocol
-    and the assetEscrower redeems the  premium for breaking the protocol 
-     */
     event PremiumRedeemed(
         address messageSender,
         uint amount,
@@ -131,10 +89,6 @@ contract TwoPartySwap {
         uint currentAsset
     );
 
-    /**
-    AssetRefunded: this event should emit when the counterparty breaks the protocol 
-    and the assetEscrower succesffully gets their asset refunded
-     */
     event AssetRefunded(
         address messageSender,
         uint amount,
@@ -144,44 +98,57 @@ contract TwoPartySwap {
         uint currentAsset
     );
 
-    /**
-    TODO: using modifiers for your require statements is best practice,
-    but we do not require you to do so
-    */ 
     modifier canSetup(bytes32 hashLock) {
+        require(swaps[hashLock].assetEscrower == address(0), "Swap already set up");
         _;
     }
 
     modifier canEscrowPremium(bytes32 hashLock) {
+        require(swaps[hashLock].assetEscrower != address(0), "Swap not set up");
+        require(premiums[hashLock].current == 0, "Premium already escrowed");
+        require(msg.sender == swaps[hashLock].premiumEscrower, "Only premium escrower can escrow premium");
         _;
     }
+
     modifier canEscrowAsset(bytes32 hashLock) {
+        require(swaps[hashLock].assetEscrower != address(0), "Swap not set up");
+        require(assets[hashLock].current == 0, "Asset already escrowed");
+        require(premiums[hashLock].current > 0, "Premium not escrowed before asset");
+        require(msg.sender == swaps[hashLock].assetEscrower, "Only asset escrower can escrow asset");
         _;
     }
 
     modifier canRedeemAsset(bytes32 preimage, bytes32 hashLock) {
+        require(keccak256(abi.encodePacked(preimage)) == hashLock, "Invalid preimage");
+        require(assets[hashLock].current > 0, "No asset escrowed");
+        require(msg.sender == swaps[hashLock].assetEscrower, "Only asset escrower can redeem asset");
+        require(block.timestamp < assets[hashLock].timeout, "Timeout reached");
         _;
     }
 
     modifier canRefundAsset(bytes32 hashLock) {
+        require(swaps[hashLock].assetEscrower != address(0), "Swap not set up");
+        require(assets[hashLock].current > 0, "No asset escrowed");
+        require(block.timestamp > assets[hashLock].deadline, "Deadline not reached");
         _;
     }
 
     modifier canRefundPremium(bytes32 hashLock) {
+        require(swaps[hashLock].assetEscrower != address(0), "Swap not set up");
+        require(premiums[hashLock].current > 0, "No premium escrowed");
+        require(block.timestamp > premiums[hashLock].deadline, "Deadline not reached");
         _;
     }
 
     modifier canRedeemPremium(bytes32 hashLock) {
+        require(swaps[hashLock].assetEscrower != address(0), "Swap not set up");
+        require(premiums[hashLock].current > 0, "No premium escrowed");
+        require(block.timestamp > assets[hashLock].timeout, "Timeout not reached");
+        require(premiums[hashLock].expected == premiums[hashLock].current, "Expected premium does not match current");
         _;
     }
-   
-    /**
-    setup is called to initialize an instance of a swap in this contract. 
-    Due to storage constraints, the various parts of the swap are spread 
-    out between the three different mappings above: swaps, assets, 
-    and premiums.
-    */
-    function setup(
+
+   function setup(
         uint expectedAssetEscrow,
         uint expectedPremiumEscrow,
         address payable assetEscrower,
@@ -196,96 +163,93 @@ contract TwoPartySwap {
         payable 
         canSetup(hashLock) 
     {
-        //TODO
-        require(swaps[hashLock].assetEscrower == address(0), "Duplicate swaps");
-        require(swaps[hashLock].premiumEscrower == address(0), "Duplicate swaps");
-    
-        Swap storage newSwap = swaps[hashLock];
-        newSwap.assetAddress = assetEscrower;
-        newSwap.premiumEscrower = premiumEscrower;
-        newSwap.hashLock = hashLock;
-        newSwap.assetAddress = assetAddress;
+        swaps[hashLock] = Swap({
+            assetEscrower: assetEscrower,
+            premiumEscrower: premiumEscrower,
+            hashLock: hashLock,
+            assetAddress: assetAddress
+        });
 
-        Asset storage newAsset = assets[hashLock];
-        newAsset.expected = expectedAssetEscrow;
-        newAsset.current = 0;
+        uint assetDeadline;
         if (firstAssetEscrow) {
-            newAsset.deadline = startTime + 3 * delta;
-            newAsset.timeout = startTime + 6 * delta;
+            assetDeadline = startTime + delta;
         } else {
-            newAsset.deadline = startTime + 4 * delta;
-            newAsset.timeout = startTime + 5 * delta;
+            assetDeadline = startTime + 2 * delta;
         }
 
-        Premium storage newPremium = premiums[hashLock];
-        newPremium.expected = expectedPremiumEscrow;
-        newPremium.current = 0;
-        if (firstAssetEscrow) {
-            newPremium.deadline = startTime + 2 * delta;
-        } else {
-            newPremium.deadline = startTime + 1 * delta;
-        }
+        uint premiumDeadline = startTime + delta;
+
+        assets[hashLock] = Asset({
+            expected: expectedAssetEscrow,
+            current: 0,
+            deadline: assetDeadline,
+            timeout: startTime + 2 * delta
+        });
+
+        premiums[hashLock] = Premium({
+            expected: expectedPremiumEscrow,
+            current: 0,
+            deadline: premiumDeadline
+        });
 
         emit SetUp(
             assetEscrower,
             premiumEscrower,
-            newPremium.expected,
-            newAsset.expected,
+            expectedPremiumEscrow,
+            expectedAssetEscrow,
             startTime,
-            newPremium.deadline,
-            newAsset.deadline,
-            newAsset.timeout
+            premiumDeadline,
+            assetDeadline,
+            startTime + 2 * delta,
+            firstAssetEscrow
         );
-
     }
 
-    /**
-    The premium escrower has to escrow their premium for the protocol to succeed.
-    */
     function escrowPremium(bytes32 hashLock)
         public
         payable
         canEscrowPremium(hashLock)
     {
-        //TODO
-        require(block.timestamp <= premiums[hashLock].deadline, "Deadline has passed");
-        require(msg.sender == swaps[hashLock].premiumEscrower, "Caller is not the premium escrower");
-        require(premiums[hashLock].current == 0, "Premium has already been escrowed");
-        require(ERC20(swaps[hashLock].assetAddress).balanceOf(msg.sender) >= premiums[hashLock].expected, "Not enough balance");
- 
-        premiums[hashLock].current += premiums[hashLock].expected;
-        ERC20(swaps[hashLock].assetAddress).transferFrom(msg.sender, address(this), premiums[hashLock].expected);
- 
+        require(msg.value >= premiums[hashLock].expected, "Insufficient premium");
+        require(msg.sender.balance >= msg.value, "Insufficient balance");
+
+        premiums[hashLock].current += msg.value;
+
         emit PremiumEscrowed(
             msg.sender,
-            premiums[hashLock].expected,
-            msg.sender,
-            address(this),
+            msg.value,
+            address(0), // Transfer from null address
+            swaps[hashLock].premiumEscrower,
             premiums[hashLock].current,
             assets[hashLock].current
         );
+
+        swaps[hashLock].premiumEscrower.transfer(msg.value);
     }
 
-    /**
-    The asset escrower has to escrow their premium for the protocol to succeed
-    */
     function escrowAsset(bytes32 hashLock) 
         public 
         payable 
         canEscrowAsset(hashLock) 
     {
-        //TODO
-        require(block.timestamp <= assets[hashLock].deadline, "Deadline has passed");
-        require(premiums[hashLock].current != 0, "Premium is not escrowed before asset");
-        require(assets[hashLock].current == 0, "Assets escrowed more than once");
-        require(ERC20(swaps[hashLock].assetAddress).balanceOf(msg.sender) >= assets[hashLock].expected, "Not enough balance");
- 
-        assets[hashLock].current += assets[hashLock].expected;
-        ERC20(swaps[hashLock].assetAddress).transferFrom(msg.sender, address(this), assets[hashLock].expected);
- 
+        IERC20 assetToken = IERC20(swaps[hashLock].assetAddress);
+        require(assetToken.allowance(msg.sender, address(this)) >= assets[hashLock].expected, "Insufficient allowance");
+        require(assetToken.balanceOf(msg.sender) >= assets[hashLock].expected, "Insufficient balance");
+
+        uint assetBalanceBefore = assetToken.balanceOf(address(this));
+
+        assetToken.safeTransferFrom(msg.sender, address(this), assets[hashLock].expected);
+
+        uint assetBalanceAfter = assetToken.balanceOf(address(this));
+        uint assetTransferred = assetBalanceAfter - assetBalanceBefore;
+
+        require(assetTransferred == assets[hashLock].expected, "Incorrect amount of asset transferred");
+
+        assets[hashLock].current += assetTransferred;
+
         emit AssetEscrowed(
             msg.sender,
-            assets[hashLock].expected,
+            assetTransferred,
             msg.sender,
             address(this),
             premiums[hashLock].current,
@@ -293,104 +257,114 @@ contract TwoPartySwap {
         );
     }
 
-    /**
-    redeemAsset redeems the asset for the new owner
-    */
     function redeemAsset(bytes32 preimage, bytes32 hashLock) 
         public 
         canRedeemAsset(preimage, hashLock) 
     {
-        //TODO
-        require(block.timestamp <= assets[hashLock].timeout, "Deadline has passed");
-        require(msg.sender == swaps[hashLock].premiumEscrower, "Not proper sendder");
-        require(sha256(abi.encode(preimage)) == hashLock, "Preimage does not hash to hashLock");
-        require(assets[hashLock].current > 0, "Asset not escrowed");
+        require(assets[hashLock].current > 0, "No asset escrowed");
+        require(msg.sender == swaps[hashLock].assetEscrower, "Only asset escrower can redeem asset");
+        require(block.timestamp < assets[hashLock].timeout, "Timeout reached");
 
-        ERC20(swaps[hashLock].assetAddress).transfer(msg.sender, assets[hashLock].current);
+        IERC20 assetToken = IERC20(swaps[hashLock].assetAddress);
+        uint assetBalanceBefore = assetToken.balanceOf(swaps[hashLock].assetEscrower);
+
+        assetToken.safeTransfer(swaps[hashLock].assetEscrower, assets[hashLock].current);
+
+        uint assetBalanceAfter = assetToken.balanceOf(swaps[hashLock].assetEscrower);
+        uint assetTransferred = assetBalanceAfter - assetBalanceBefore;
+
+        require(assetTransferred == assets[hashLock].current, "Incorrect amount of asset redeemed");
 
         emit AssetRedeemed(
             msg.sender,
             assets[hashLock].current,
             address(this),
-            msg.sender,
+            swaps[hashLock].assetEscrower,
             premiums[hashLock].current,
             0
         );
 
-        assets[hashLock].current = 0;
+        delete swaps[hashLock];
+        delete assets[hashLock];
+        delete premiums[hashLock];
     }
 
-    /**
-    refundPremium refunds the premiumEscrower's premium should the swap succeed
-    */
     function refundPremium(bytes32 hashLock) 
         public 
         canRefundPremium(hashLock)
     {
-        //TODO
-        require(premiums[hashLock].current > 0, "Premium not escrowed");
-        require(assets[hashLock].current == 0, "Asset already escrowed");
-        require(block.timestamp > premiums[hashLock].deadline, "Too early to refund premium");
+        require(block.timestamp > premiums[hashLock].deadline, "Deadline not reached");
 
-        ERC20(swaps[hashLock].assetAddress).transfer(swaps[hashLock].premiumEscrower, premiums[hashLock].current);
+        uint refundAmount = premiums[hashLock].current;
+        premiums[hashLock].current = 0;
+
+        (bool success, ) = swaps[hashLock].premiumEscrower.call{value: refundAmount}("");
+        require(success, "Failed to send refund");
 
         emit PremiumRefunded(
             msg.sender,
-            premiums[hashLock].current,
+            refundAmount,
             address(this),
-            msg.sender,
+            swaps[hashLock].premiumEscrower,
             0,
             assets[hashLock].current
         );
+
+        delete swaps[hashLock];
+        delete assets[hashLock];
+        delete premiums[hashLock];
     }
 
-    /**
-    refundAsset refunds the asset to its original owner should the swap fail
-    */
     function refundAsset(bytes32 hashLock) 
         public 
         canRefundAsset(hashLock) 
     {
-       //TODO
-       require(block.timestamp > assets[hashLock].deadline, "Too early to refund asset");
-       require(assets[hashLock].current > 0, "Asset not escrowed");
+        require(block.timestamp > assets[hashLock].deadline, "Deadline not reached");
 
-       ERC20(swaps[hashLock].assetAddress).transfer(msg.sender, assets[hashLock].current);
+        IERC20 assetToken = IERC20(swaps[hashLock].assetAddress);
+        uint refundAmount = assets[hashLock].current;
+        assets[hashLock].current = 0;
 
-       emit AssetRefunded(
+        assetToken.safeTransfer(swaps[hashLock].assetEscrower, refundAmount);
+
+        emit AssetRefunded(
             msg.sender,
-            assets[hashLock].current,
+            refundAmount,
             address(this),
-            msg.sender,
+            swaps[hashLock].assetEscrower,
             premiums[hashLock].current,
             0
-       );
+        );
+
+        delete swaps[hashLock];
+        delete assets[hashLock];
+        delete premiums[hashLock];
     }
 
-    /**
-    redeemPremium allows a party to redeem the counterparty's premium should the swap fail
-    */
     function redeemPremium(bytes32 hashLock) 
         public 
         canRedeemPremium(hashLock)
     {
-        //TODO
-        require(premiums[hashLock].current > 0, "Premium is not escrowed");
+        require(block.timestamp > assets[hashLock].timeout, "Timeout not reached");
         require(premiums[hashLock].expected == premiums[hashLock].current, "Expected premium does not match current");
-        require(assets[hashLock].expected > 0, "Expected asset amount is 0");
-        require(block.timestamp > premiums[hashLock].deadline, "Too early to redeem premium");
 
-        ERC20(swaps[hashLock].assetAddress).transfer(msg.sender, premiums[hashLock].current);
+        uint redeemAmount = premiums[hashLock].current;
+        premiums[hashLock].current = 0;
+
+        (bool success, ) = swaps[hashLock].assetEscrower.call{value: redeemAmount}("");
+        require(success, "Failed to send redeem amount");
 
         emit PremiumRedeemed(
             msg.sender,
-            premiums[hashLock].current,
+            redeemAmount,
             address(this),
-            msg.sender,
+            swaps[hashLock].premiumEscrower,
             0,
             assets[hashLock].current
         );
 
-        premiums[hashLock].current = 0;
+        delete swaps[hashLock];
+        delete assets[hashLock];
+        delete premiums[hashLock];
     }
 }
